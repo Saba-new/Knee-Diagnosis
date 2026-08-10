@@ -1,0 +1,26 @@
+path : data/graph_inhouse_example
+result : results
+index_folder : data/fold_inhouse_example
+num_cls : 3
+views: sag,cor,axi
+
+# Training Settings
+num_workers : 2
+bs : 2
+num_epoch : 20
+
+# Optimizer settings
+lr : 3.0e-5
+weight_decay : 1.0e-4
+
+# Model Settings
+task : finetune_inhouse_soft
+input_size : 64
+net : KGNet
+
+# Rich Label Settings
+label_mode : soft         # KL-divergence loss against ordinal-prior soft targets
+ordinal_alpha : 0.1       # smoothing strength; tune on validation, NEVER on test
+num_labels : 1            # not used in soft mode
+cls_weights : null
+freeze_encoder : false

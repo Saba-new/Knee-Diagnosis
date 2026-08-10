@@ -5,14 +5,30 @@ from einops import rearrange
 from torch.utils.data import DataLoader, Dataset
 
 from utils.Config import Config
+from utils.soft_label import build_ordinal_soft_label
 
 
 class KGNetDataset(Dataset):
     def __init__(self, data_type: str, cfg: Config, topk=None):
         super(KGNetDataset, self).__init__()
-        self.cfg = cfg
-        self.topk = topk
-        self.f = np.loadtxt(f"{cfg.index_folder}/{data_type}_{cfg.fold}.csv", dtype=str)
+        self.cfg        = cfg
+        self.topk       = topk
+        self.label_mode = cfg.label_mode
+        self.f = np.loadtxt(
+            f"{cfg.index_folder}/{data_type}_{cfg.fold}.csv", dtype=str
+        )
+        # For multi_label mode on MRNet: load the secondary label CSV.
+        # Expects files:  <index_folder>/multi_<task>_<fold>.csv
+        # Each line: <path>,<abnormality_label>,<acl_label>
+        # Falls back gracefully if the file does not exist (non-MRNet datasets).
+        self.multi_label_data = None
+        if self.label_mode == "multi_label":
+            ml_path = f"{cfg.index_folder}/multi_{data_type}_{cfg.fold}.csv"
+            try:
+                self.multi_label_data = np.loadtxt(ml_path, dtype=str)
+            except OSError:
+                # File not found: multi_label will be [0, 0] as placeholder.
+                pass
 
     def __len__(self):
         return len(self.f)
@@ -44,7 +60,31 @@ class KGNetDataset(Dataset):
 
         pos = self.norm_pos(pos)
         name = self.f[idx]
-        return (graph, patch, seg, pos, grade, les, name, mean, std)
+
+        # --- Soft label (ordinal prior) ---
+        soft_label = None
+        if self.label_mode == "soft":
+            soft_label = build_ordinal_soft_label(
+                int(grade.item()),
+                num_classes=self.cfg.num_cls,
+                alpha=self.cfg.ordinal_alpha,
+            )
+            soft_label = torch.tensor(soft_label, dtype=torch.float32)
+
+        # --- Multi-label vector (MRNet joint tasks) ---
+        multi_label = None
+        if self.label_mode == "multi_label":
+            if self.multi_label_data is not None:
+                row = self.multi_label_data[idx]
+                multi_label = torch.tensor(
+                    [float(row[1]), float(row[2])], dtype=torch.float32
+                )
+            else:
+                # Placeholder if CSV not found
+                multi_label = torch.zeros(self.cfg.num_labels, dtype=torch.float32)
+
+        return (graph, patch, seg, pos, grade, les, name, mean, std,
+                soft_label, multi_label)
 
     def norm_pos(self, pos):
         for i in range(3):
@@ -90,13 +130,16 @@ class KGNetDataset(Dataset):
 class KGNetData(object):
     def __init__(self):
         super().__init__()
-        self.patch = None
-        self.pos = None
-        self.les = None
-        self.seg = None
-        self.graph = None
-        self.grade = None
-        self.name = None
+        self.patch      = None
+        self.pos        = None
+        self.les        = None
+        self.seg        = None
+        self.graph      = None
+        self.grade      = None
+        self.name       = None
+        self.soft_label  = None   # float [B, num_cls]  — populated in soft mode
+        self.multi_label = None   # float [B, num_labels] — populated in multi_label mode
+        self.label_mode  = "single"
 
         self.N = -1
         self.keep = None
@@ -111,28 +154,42 @@ class KGNetData(object):
 
     def to(self, device):
         self.patch = self.patch.to(device)
-        self.pos = self.pos.to(device)
-        self.seg = self.seg.to(device)
-        self.les = self.les.to(device)
+        self.pos   = self.pos.to(device)
+        self.seg   = self.seg.to(device)
+        self.les   = self.les.to(device)
         self.graph = self.graph.to(device)
         self.grade = self.grade.to(device)
+        if self.soft_label is not None:
+            self.soft_label = self.soft_label.to(device)
+        if self.multi_label is not None:
+            self.multi_label = self.multi_label.to(device)
         return
 
 
 def collate(samples):
     _data = KGNetData()
     samples = list(filter(lambda x: x is not None, samples))
-    graphs, patch, seg, pos, grade, les, names, mean, std = map(list, zip(*samples))
-    _data.patch = torch.cat(patch, dim=0)
-    _data.seg = torch.cat(seg, dim=0)
-    _data.les = torch.cat(les, dim=0)
-    _data.pos = torch.cat(pos, dim=0)
-    _data.graph = dgl.batch(graphs)
-    _data.grade = torch.tensor(grade, dtype=torch.long)
-    _data.name = names
-    _data.N = _data.patch.shape[0]
-    _data.mean = mean[0]
-    _data.std = std[0]
+    graphs, patch, seg, pos, grade, les, names, mean, std, soft_labels, multi_labels = \
+        map(list, zip(*samples))
+    _data.patch  = torch.cat(patch, dim=0)
+    _data.seg    = torch.cat(seg, dim=0)
+    _data.les    = torch.cat(les, dim=0)
+    _data.pos    = torch.cat(pos, dim=0)
+    _data.graph  = dgl.batch(graphs)
+    _data.grade  = torch.tensor(grade, dtype=torch.long)
+    _data.name   = names
+    _data.N      = _data.patch.shape[0]
+    _data.mean   = mean[0]
+    _data.std    = std[0]
+
+    # Soft labels (None when label_mode != 'soft')
+    if soft_labels[0] is not None:
+        _data.soft_label = torch.stack(soft_labels, dim=0)
+
+    # Multi-labels (None when label_mode != 'multi_label')
+    if multi_labels[0] is not None:
+        _data.multi_label = torch.stack(multi_labels, dim=0)
+
     return _data
 
 

@@ -40,6 +40,14 @@ class Config(object):
         self.input_size = cfg["input_size"]
         self.num_epoch = cfg["num_epoch"]
 
+        # Rich Label Settings — all have backward-compatible defaults so that
+        # existing config files that lack these keys continue to work unchanged.
+        self.label_mode     = cfg.get("label_mode",     "single")
+        self.ordinal_alpha  = cfg.get("ordinal_alpha",  0.0)
+        self.num_labels     = cfg.get("num_labels",     1)
+        self.cls_weights    = cfg.get("cls_weights",    None)
+        self.freeze_encoder = cfg.get("freeze_encoder", False)
+
         self.TIME = time.strftime("%Y-%m-%d-%H-%M-%S")  # time of we run the script
 
         if self.test:

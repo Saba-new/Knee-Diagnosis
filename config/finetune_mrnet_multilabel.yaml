@@ -14,13 +14,13 @@ lr : 3.0e-5
 weight_decay : 1.0e-4
 
 # Model Settings
-task : finetune_mrnet
+task : finetune_mrnet_multilabel
 input_size : 64
 net : KGNet
 
-# Rich Label Settings (default = original behaviour)
-label_mode : single       # options: single | ordinal | soft | multi_label
-ordinal_alpha : 0.0
-num_labels : 2            # MRNet has 2 tasks: [abnormality, acl]
+# Rich Label Settings
+label_mode : multi_label  # BCEWithLogitsLoss; jointly predicts ACL + Abnormality
+num_labels : 2            # [abnormality, acl]
+ordinal_alpha : 0.0       # not used in multi_label mode
 cls_weights : null
 freeze_encoder : false

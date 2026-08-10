@@ -17,3 +17,10 @@ weight_decay : 1.0e-4
 task : finetune_inhouse
 input_size : 64
 net : KGNet
+
+# Rich Label Settings (default = original behaviour)
+label_mode : single       # options: single | ordinal | soft | multi_label
+ordinal_alpha : 0.0       # smoothing for soft mode (0 = no smoothing)
+num_labels : 1            # used only when label_mode = multi_label
+cls_weights : null        # null = uniform; or [w0, w1, w2] for weighted CE
+freeze_encoder : false

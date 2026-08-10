@@ -10,6 +10,8 @@ from einops import rearrange
 from torch.nn.utils.rnn import pad_sequence
 import torch.nn.functional as F
 
+from utils.ordinal import corn_loss, corn_label_to_probas
+
 from network.dataloader import KGNetData
 from network.decoder import Decoder
 from network.encoder import Encoders
@@ -21,8 +23,44 @@ from utils.Config import Config
 MAX_NODE_NUM = 600
 
 
+class DiagnosisHead(nn.Module):
+    """
+    Plug-in replacement for the single linear classifier.
+
+    Preserves the original behaviour when mode='single' (same weight shape,
+    same CrossEntropyLoss). New modes are selected via the label_mode config key.
+
+    Output shapes:
+        single     → [B, num_cls]      CrossEntropyLoss
+        soft       → [B, num_cls]      KLDivLoss(log_softmax, soft_target)
+        ordinal    → [B, num_cls - 1]  CORN loss (Shi et al. 2021)
+        multi_label→ [B, num_labels]   BCEWithLogitsLoss
+    """
+
+    def __init__(self, g_dim: int, num_cls: int,
+                 mode: str = "single", num_labels: int = 1):
+        super().__init__()
+        self.mode = mode
+        if mode in ("single", "soft"):
+            self.fc = nn.Linear(g_dim, num_cls)
+        elif mode == "ordinal":
+            # CORN: outputs K-1 binary conditional probabilities
+            self.fc = nn.Linear(g_dim, num_cls - 1)
+        elif mode == "multi_label":
+            self.fc = nn.Linear(g_dim, num_labels)
+        else:
+            raise ValueError(
+                f"Unknown label_mode '{mode}'. "
+                "Choose from: single | soft | ordinal | multi_label"
+            )
+
+    def forward(self, mx: torch.Tensor) -> torch.Tensor:
+        return self.fc(mx)
+
+
 class KneeGraphNetwork(nn.Module):
-    def __init__(self, num_cls=3, pretrain_from_imagenet=False):
+    def __init__(self, num_cls=3, pretrain_from_imagenet=False,
+                 label_mode: str = "single", num_labels: int = 1):
         super().__init__()
 
         # Patch Encoders
@@ -39,7 +77,15 @@ class KneeGraphNetwork(nn.Module):
         self.xproj = nn.Linear(patch_dim, g_dim)
 
         # Graph Pooling and Classifier
-        self.gclassifier = nn.Linear(g_dim, num_cls)
+        # gclassifier kept as-is for backward compatibility when mode='single'.
+        # For other modes, DiagnosisHead is used instead.
+        self.label_mode  = label_mode
+        self.gclassifier = DiagnosisHead(
+            g_dim=g_dim,
+            num_cls=num_cls,
+            mode=label_mode,
+            num_labels=num_labels,
+        )
 
         # Decoder for Pre-Training
         self.decoder_seg = Decoder(out_size=64, num_classes=8 * 3)
@@ -104,7 +150,7 @@ class KneeGraphNetwork(nn.Module):
         with g.local_scope():
             g.ndata["x"] = x
             mx = dgl.mean_nodes(g, "x")
-        out["cls"] = self.gclassifier(mx)
+        out["cls"] = self.gclassifier(mx)   # DiagnosisHead handles all modes
         return out
 
     def load_pretrain(self, pre_path: str):
@@ -155,14 +201,26 @@ class KneeGraphNetwork(nn.Module):
 
 
 class KneeLoss(object):
-    def __init__(self, device, dataset_name) -> None:
-        self.seg_func = nn.CrossEntropyLoss().to(device)
-        self.rec_func = nn.MSELoss().to(device)
-        self.les_func = nn.CrossEntropyLoss(weight=torch.tensor([0.025, 1.25, 1.0])).to(device)
+    def __init__(self, device, dataset_name, label_mode: str = "single",
+                 num_cls: int = 3) -> None:
+        self.device     = device
+        self.label_mode = label_mode
+        self.num_cls    = num_cls
+        self.seg_func   = nn.CrossEntropyLoss().to(device)
+        self.rec_func   = nn.MSELoss().to(device)
+        self.les_func   = nn.CrossEntropyLoss(
+            weight=torch.tensor([0.025, 1.25, 1.0])
+        ).to(device)
         if dataset_name == "inhouse":
-            self.cls_func = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 1.0, 1.0])).to(device)
+            self.cls_func = nn.CrossEntropyLoss(
+                weight=torch.tensor([1.0, 1.0, 1.0])
+            ).to(device)
         elif dataset_name == "mrnet":
-            self.cls_func = nn.CrossEntropyLoss(weight=torch.tensor([1.0,1.0])).to(device)
+            self.cls_func = nn.CrossEntropyLoss(
+                weight=torch.tensor([1.0, 1.0])
+            ).to(device)
+        else:
+            self.cls_func = nn.CrossEntropyLoss().to(device)
 
     def rec_(self, data: KGNetData, pred: torch.Tensor):
         true = data.patch
@@ -195,8 +253,37 @@ class KneeLoss(object):
         return self.seg_(data, pred["seg"])
 
     def cls(self, data: KGNetData, pred):
-        true = data.grade
-        return self.cls_func(pred["cls"], true)
+        """
+        Dispatch classification loss based on label_mode.
+
+        single      → CrossEntropyLoss (original behaviour, unchanged)
+        ordinal     → CORN ordinal loss (Shi et al. 2021)
+        soft        → KL-divergence against ordinal-prior soft targets
+        multi_label → BCEWithLogitsLoss (independent binary heads)
+        """
+        mode = self.label_mode
+
+        if mode == "single":
+            # Original behaviour — identical to the pre-extension code
+            return self.cls_func(pred["cls"], data.grade)
+
+        elif mode == "ordinal":
+            # CORN: outputs [B, num_cls-1] conditional binary logits
+            return corn_loss(pred["cls"], data.grade, num_classes=self.num_cls)
+
+        elif mode == "soft":
+            # KL divergence: D_KL(soft_target || log_softmax(logits))
+            log_probs = F.log_softmax(pred["cls"], dim=1)
+            return F.kl_div(log_probs, data.soft_label, reduction="batchmean")
+
+        elif mode == "multi_label":
+            # Independent binary cross-entropy for each label
+            return F.binary_cross_entropy_with_logits(
+                pred["cls"], data.multi_label
+            )
+
+        else:
+            raise ValueError(f"Unknown label_mode '{mode}' in KneeLoss.cls()")
 
     def les(self, data: KGNetData, pred):
         true = data.les

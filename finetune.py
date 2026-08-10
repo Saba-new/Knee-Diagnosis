@@ -14,6 +14,8 @@ from network.kgnet import KneeGraphNetwork, KneeLoss
 from network.dataloader import KGNetDataloader as Dataloader
 from utils.Config import Config
 from utils.Result_cls import Result
+from utils.Result_ordinal import ResultOrdinal
+from utils.Result_multilabel import ResultMultiLabel
 from utils.utils_net import init_train, save_model
 from utils.parser import args
 
@@ -49,10 +51,13 @@ def eval(dataset_type, _result):
     for data in dataloader[dataset_type]:
         data.to(cfg.device)
         preds = net(data)
-        _result.eval(preds, data.grade)
+        if cfg.label_mode == "multi_label":
+            # ResultMultiLabel.eval takes raw logits + binary float targets
+            _result.eval(preds["cls"], data.multi_label)
+        else:
+            # Result / ResultOrdinal both accept the full preds dict + grade
+            _result.eval(preds, data.grade)
     pars = _result.stastic()
-    # if not args.t:
-    #     wandb.log({"acc": pars[0], "rec": pars[1], "spe": pars[2], "pre": pars[3], "f1": pars[4], "auc": pars[5]})
     _result.print()
     return
 
@@ -63,15 +68,38 @@ if __name__ == "__main__":
     cfg = Config(args)
     dataloader = Dataloader(cfg)
     init_train(cfg)
-    net = KneeGraphNetwork(cfg.num_cls, False)
+
+    # Build network — passes label_mode and num_labels so DiagnosisHead is configured
+    net = KneeGraphNetwork(
+        num_cls=cfg.num_cls,
+        pretrain_from_imagenet=False,
+        label_mode=cfg.label_mode,
+        num_labels=cfg.num_labels,
+    )
     net.load_pretrain(cfg.ckpt)
     net = net.to(cfg.device)
-    print(args.dataset)
-    lossfunc = KneeLoss(cfg.device, args.dataset)
+    print(f"dataset={args.dataset}  label_mode={cfg.label_mode}")
+
+    # Build loss — passes label_mode and num_cls for dispatch
+    lossfunc = KneeLoss(
+        cfg.device, args.dataset,
+        label_mode=cfg.label_mode,
+        num_cls=cfg.num_cls,
+    )
     optimizer = optim.Adam(net.parameters(), cfg.lr, weight_decay=cfg.wd)
     scheduler = CosineAnnealingLR(optimizer, cfg.num_epoch, 1e-8)
-    result_valid = Result(cfg, "valid")
-    result_test = Result(cfg, "test")
+
+    # Build result trackers appropriate for the selected label_mode
+    if cfg.label_mode == "multi_label":
+        result_valid = ResultMultiLabel(label_names=["abnormality", "acl"])
+        result_test  = ResultMultiLabel(label_names=["abnormality", "acl"])
+    elif cfg.label_mode in ("ordinal", "soft"):
+        result_valid = ResultOrdinal(cfg, "valid")
+        result_test  = ResultOrdinal(cfg, "test")
+    else:
+        # label_mode == 'single'  — original behaviour unchanged
+        result_valid = Result(cfg, "valid")
+        result_test  = Result(cfg, "test")
     
 
     net.forward = net.finetune
